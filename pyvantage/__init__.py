@@ -218,7 +218,6 @@ class VantageConnection(threading.Thread):
         except BrokenPipeError:
             _LOGGER.warning("Vantage BrokenPipeError - disconnected but retrying")
             self._connected[i] = False
-            raise
 
     def send_ascii_nl(self, cmd):
         """Sends the specified command to the vantage controller.
@@ -393,17 +392,27 @@ class VantageXmlDbParser():
         areas = root.findall(".//Objects//Area[@VID]")
         for area_xml in areas:
             if self.project_name is None:
-                self.project_name = area_xml.find('Name').text
+                self.project_name = area_xml.findtext('Name')
                 _LOGGER.debug("Set project name to %s", self.project_name)
             area = self._parse_area(area_xml)
             _LOGGER.debug("Area = %s", area)
-            self.vid_to_area[area.vid] = area
+            if area and area.vid not in self.vid_to_area:
+                self.vid_to_area[area.vid] = area
+            elif area and area.vid in self.vid_to_area:
+                self.vid_to_area[area.vid].name = area.name or self.vid_to_area[area.vid].name
+                self.vid_to_area[area.vid].parent = area.parent if area.parent and area.parent > self.vid_to_area[area.vid].parent else self.vid_to_area[area.vid].parent
+                self.vid_to_area[area.vid].note = area.note or self.vid_to_area[area.vid].note
 
         irzones = root.findall(".//Objects//IRZone[@VID]")
         for irzone_xml in irzones:
             area = self._parse_irzone(irzone_xml)
             _LOGGER.debug("IRZone = %s", area)
-            self.vid_to_area[area.vid] = area
+            if area and area.vid not in self.vid_to_area:
+                self.vid_to_area[area.vid] = area
+            elif area:
+                self.vid_to_area[area.vid].name = area.name or self.vid_to_area[area.vid].name
+                self.vid_to_area[area.vid].parent = area.parent if area.parent and area.parent > self.vid_to_area[area.vid].parent else self.vid_to_area[area.vid].parent
+                self.vid_to_area[area.vid].note = area.note or self.vid_to_area[area.vid].note
 
         loads = root.findall(".//Objects//Load[@VID]")
         loads = loads + root.findall(".//Objects//Vantage.DDGColorLoad[@VID]")
@@ -411,19 +420,19 @@ class VantageXmlDbParser():
         color_loads = []
         open_loads = []
         for ld in loads:
-            t = ld.find('Name').text
-            if t.endswith(' COLOR'):
+            t = ld.findtext('Name')
+            if t and t.endswith(' COLOR'):
                 color_loads.append(ld)
-            elif t.lower().endswith(' open'):
+            elif t and t.lower().endswith(' open'):
                 open_loads.append(ld)
             else:
                 other_loads.append(ld)
         ordered_loads = open_loads + other_loads + color_loads
         skip_load_vids = set()
         for load_xml in ordered_loads:
-            xml_name = load_xml.find('Name').text
+            xml_name = load_xml.findtext('Name')
             output = None
-            if xml_name.lower().endswith(" open"):
+            if xml_name and xml_name.lower().endswith(" open"):
                 close_name = replace_keep_case(' open', " close", xml_name)
                 stop_name = replace_keep_case(' open', " stop", xml_name)
                 isopen_name = replace_keep_case(' open', " is open", xml_name)
@@ -461,23 +470,36 @@ class VantageXmlDbParser():
                 _LOGGER.debug("Skipping %s because used for blind3", load_xml)
                 continue
             output = self._parse_output(load_xml)
-            if output is None:
-                continue
-            self.outputs.append(output)
-            self.vid_to_load[output.vid] = output
-            _LOGGER.debug("Output = %s", output)
-            self.vid_to_area[output.area].add_output(output)
-
+            if output and output.vid not in self.vid_to_load and output.name != 'Spare':
+                self.outputs.append(output)
+                self.vid_to_load[output.vid] = output
+                self.vid_to_area[output.area].add_output(output)
+                _LOGGER.debug("Output = %s", output)
+            elif output and output.vid in self.vid_to_load:
+                self.vid_to_load[output.vid].name = output.name or self.vid_to_load[output.vid].name
+                self.vid_to_load[output.vid].area = output.area  if output.area and output.area > self.vid_to_load[output.vid].area else self.vid_to_load[output.vid].area
+                self.vid_to_load[output.vid].output_type = output.output_type or self.vid_to_load[output.vid].output_type
+                self.vid_to_load[output.vid].load_type = output.load_type or self.vid_to_load[output.vid].load_type
+                self.vid_to_load[output.vid].cc_vid = output.cc_vid or self.vid_to_load[output.vid].cc_vid
+                
+            
         load_groups = root.findall(".//Objects//LoadGroup[@VID]")
         for lg_xml in load_groups:
             lgroup = self._parse_load_group(lg_xml)
             if lgroup is None:
                 continue
-            self.load_groups.append(lgroup)
-            self.outputs.append(lgroup)
-            self.vid_to_load[lgroup.vid] = lgroup
-            _LOGGER.debug("load group = %s", lgroup)
-            self.vid_to_area[lgroup.area].add_output(lgroup)
+            if lgroup and lgroup.vid not in self.vid_to_load:
+                self.load_groups.append(lgroup)
+                self.outputs.append(lgroup)
+                self.vid_to_load[lgroup.vid] = lgroup
+                _LOGGER.debug("load group = %s", lgroup)
+                self.vid_to_area[lgroup.area].add_output(lgroup)
+            elif lgroup and lgroup.vid in self.vid_to_load:
+                self.vid_to_load[lgroup.vid].name = lgroup.name or self.vid_to_load[lgroup.vid].name
+                self.vid_to_load[lgroup.vid].area = lgroup.area if lgroup.area and lgroup.area > self.vid_to_load[lgroup.vid].area else self.vid_to_load[lgroup.vid].area
+                self.vid_to_load[lgroup.vid].output_type = lgroup.output_type or self.vid_to_load[lgroup.vid].output_type
+                self.vid_to_load[lgroup.vid].load_type = lgroup.load_type or self.vid_to_load[lgroup.vid].load_type
+                self.vid_to_load[lgroup.vid].cc_vid = lgroup.cc_vid or self.vid_to_load[lgroup.vid].cc_vid
 
         keypads = root.findall(".//Objects//Keypad[@VID]")
         keypads = keypads + root.findall(".//Objects//DualRelayStation[@VID]")
@@ -579,11 +601,12 @@ class VantageXmlDbParser():
         Vantage controller programming was done."""
         try:
             vid = int(area_xml.get('VID'))
+            area_parent = area_xml.findtext('Area')
             area = Area(self._vantage,
-                        name=area_xml.find('Name').text,
-                        parent=int(area_xml.find('Area').text),
+                        name=area_xml.findtext('Name'),
+                        parent=int(area_parent) if area_parent and area_parent.isnumeric() else -1,
                         vid=vid,
-                        note=area_xml.find('Note').text)
+                        note=area_xml.findtext('Note'))
             return area
         except Exception as e:
             _LOGGER.warning("Error parsing Area vid = %d: %s", vid, e)
@@ -593,10 +616,10 @@ class VantageXmlDbParser():
         try:
             vid = int(irzone_xml.get('VID'))
             irzone = Area(self._vantage,
-                          name=irzone_xml.find('Name').text,
+                          name=irzone_xml.findtext('Name'),
                           parent=0,
                           vid=vid,
-                          note=irzone_xml.find('Note').text)
+                          note=irzone_xml.findtext('Note'))
             return irzone
         except Exception as e:
             _LOGGER.warning("Error parsing IRZone vid = %d: %s", vid, e)
@@ -610,7 +633,7 @@ class VantageXmlDbParser():
             if subtype_node is not None:
                 subtype = subtype_node.text.lower()
             var = Variable(self._vantage,
-                           name=var_xml.find('Name').text,
+                           name=var_xml.findtext('Name'),
                            vid=vid, subtype=subtype)
             return var
         except Exception as e:
@@ -624,9 +647,9 @@ class VantageXmlDbParser():
                 "Power": "power",
                 "Current": "current",
                 "Temperature": "sensor"
-            }[sensor_xml.find('Model').text]
+            }[sensor_xml.findtext('Model')]
             sensor = OmniSensor(self._vantage,
-                                name=sensor_xml.find('Name').text,
+                                name=sensor_xml.findtext('Name'),
                                 kind=kind,
                                 vid=int(sensor_xml.get('VID')))
             return sensor
@@ -638,11 +661,11 @@ class VantageXmlDbParser():
         try:
             vid = int(sensor_xml.get('VID'))
             area_xml = sensor_xml.find('Area')
-            area = (area_xml is not None and int(area_xml.text)) or -1
-            value_range = (float(sensor_xml.find('RangeLow').text),
-                           float(sensor_xml.find('RangeHigh').text))
+            area =  int(area_xml.text) if area_xml and area_xml.text.isnumeric() else -1
+            value_range = (float(sensor_xml.findtext('RangeLow')),
+                           float(sensor_xml.findtext('RangeHigh')))
             return LightSensor(self._vantage,
-                               name=sensor_xml.find('Name').text,
+                               name=sensor_xml.findtext('Name'),
                                area=area,
                                value_range=value_range,
                                vid=vid)
@@ -657,9 +680,10 @@ class VantageXmlDbParser():
         """
         try:
             vid = int(shade_xml.get('VID'))
+            area_previd = shade_xml.findtext('Area')
             shade = Shade(self._vantage,
-                          name=shade_xml.find('Name').text,
-                          area_vid=int(shade_xml.find('Area').text),
+                          name=shade_xml.findtext('Name'),
+                          area_vid=int(area_previd) if area_previd and area_previd.isnumeric() else -1,
                           vid=vid)
             return shade
         except Exception as e:
@@ -674,20 +698,20 @@ class VantageXmlDbParser():
         """
         try:
             vid = int(output_xml.get('VID'))
-            dname_xml = output_xml.find('DName')
-            out_name = dname_xml is not None and dname_xml.text
+            out_name = output_xml.findtext('DName')
+            if not out_name or out_name.isspace():
+                out_name = output_xml.findtext('Name')
             if out_name:
                 out_name = out_name.strip()
-            if not out_name or out_name.isspace():
-                out_name = output_xml.find('Name').text.strip()
-            area_vid = int(output_xml.find('Area').text)
-
-            area_name = self.vid_to_area[area_vid].name.strip()
-            lt_xml = output_xml.find('LoadType')
-            if lt_xml is not None:
-                load_type = lt_xml.text.strip()
-            else:
-                load_type = output_xml.find('ColorType').text.strip()
+            area_previd = output_xml.findtext('Area')
+            area_vid = int(area_previd) if area_previd and area_previd.isnumeric() else -1
+            if area_vid in self.vid_to_area and self.vid_to_area[area_vid].name:
+                area_name = self.vid_to_area[area_vid].name.strip()
+            load_type = output_xml.findtext('LoadType')
+            if not load_type:
+                load_type = output_xml.findtext('ColorType')
+            if load_type:
+                load_type = load_type.strip()
 
             output_type = 'LIGHT'
 
@@ -730,23 +754,23 @@ class VantageXmlDbParser():
             # and that only support_color_temp)
             dmx_color = False
             if load_type.startswith("RGB"):
-                ch1 = output_xml.find('Channel1')
-                ch2 = output_xml.find('Channel2')
-                ch3 = output_xml.find('Channel3')
+                ch1 = output_xml.findtext('Channel1')
+                ch2 = output_xml.findtext('Channel2')
+                ch3 = output_xml.findtext('Channel3')
                 # _LOGGER.debug("ch1 = %s, ch2 = %s", ch1.text, ch2.text)
-                if not(ch1.text and ch1.text.strip() != ""):
+                if not ch1 or ch1.isspace():
                     _LOGGER.warning("RGB* load with missing Channel1: %s",
                                     out_name)
-                if not(ch3.text and ch3.text.strip() != ""):
+                if not ch3 or ch3.isspace():
                     _LOGGER.warning("RGB* load with missing Channel3: %s",
                                     out_name)
                 if load_type == "RGBW":
-                    if not(ch2.text and ch2.text.strip() != ""):
+                    if not ch2 or ch2.isspace():
                         _LOGGER.warning("RGBW load with missing Channel2: %s",
                                         out_name)
                     dmx_color = True
                 else:   # load_type == "RGB"
-                    if ch2.text and ch2.text.strip() != "":
+                    if not ch2 or ch2.isspace():
                         dmx_color = True
                     else:
                         # just a dynamic white red/blue light
@@ -780,11 +804,13 @@ class VantageXmlDbParser():
                 int(close_xml.get('VID')),
                 int(stop_xml.get('VID')) if stop_xml else None]
 
-        shade_name = open_xml.find('Name').text.strip()[:-5]
-        area_vid = int(open_xml.find('Area').text)
-        if ((area_vid != int(close_xml.find('Area').text) or
-             (isopen_xml and area_vid != int(isopen_xml.find('Area').text)) or
-             (stop_xml and area_vid != int(stop_xml.find('Area').text)))):
+        shade_name = open_xml.findtext('Name')
+        shade_name = shade_name.strip()[:-5] if shade_name else None
+        area_previd = open_xml.findtext('Area')
+        area_vid = int(area_previd) if area_previd and area_previd.isnumeric() else -1
+        if ((area_vid != int(close_xml.findtext('Area')) or
+             (isopen_xml and area_vid != int(isopen_xml.findtext('Area'))) or
+             (stop_xml and area_vid != int(stop_xml.findtext('Area'))))):
             _LOGGER.warning("open/close/stop/isopen device "
                             "areas do not match: %s", shade_name)
             return None
@@ -796,14 +822,15 @@ class VantageXmlDbParser():
 
     def _parse_load_group(self, output_xml):
         """Parses a load group, which is a set of loads"""
-        out_name = output_xml.find('DName').text
+        out_name = output_xml.findtext('DName')
         if out_name:
             out_name = out_name.strip()
         if not out_name or out_name.isspace():
-            out_name = output_xml.find('Name').text
+            out_name = output_xml.findtext('Name')
         else:
             _LOGGER.debug("Using dname = %s", out_name)
-        area_vid = int(output_xml.find('Area').text)
+        area_previd = output_xml.findtext('Area')            
+        area_vid = int(area_previd) if area_previd and area_previd.isnumeric() else -1
 
 #        area_name = self.vid_to_area[area_vid].name
         loads = output_xml.findall('./LoadTable/Load')
@@ -844,7 +871,7 @@ class VantageXmlDbParser():
         area_xml = keypad_xml.find('Area')
         area_vid = int(area_xml.text) if area_xml else -1
         keypad = Keypad(self._vantage,
-                        name=keypad_xml.find('Name').text + ' [K]',
+                        name=keypad_xml.findtext('Name') + ' [K]',
                         area=area_vid,
                         vid=int(keypad_xml.get('VID')))
         return keypad
@@ -852,7 +879,7 @@ class VantageXmlDbParser():
     def _parse_task(self, task_xml):
         """Parses a task object."""
         task = Task(self._vantage,
-                    name=task_xml.find('Name').text,
+                    name=task_xml.findtext('Name'),
                     vid=int(task_xml.get('VID')))
         return task
 
@@ -868,11 +895,11 @@ class VantageXmlDbParser():
                 _LOGGER.debug("Skipping vid=%d as drycontact "
                               "because already part of a BLIND3", vid)
                 return None
-            name = dc_xml.find('Name').text + ' [C]'
-            parent = dc_xml.find('Parent')
-            parent_vid = int(parent.text)
-            area_xml = dc_xml.find('Area')
-            area_vid = int(area_xml.text) if area_xml else -1
+            name = dc_xml.findtext('Name') + ' [C]'
+            parent = dc_xml.findtext('Parent')
+            parent_vid = int(parent)
+            area_xml = dc_xml.findtext('Area')
+            area_vid = int(area_xml) if area_xml and area_xml.isnumeric() else -1
             num = 0
             keypad = None
             _LOGGER.debug("Found DryContact with vid = %d", vid)
@@ -889,10 +916,10 @@ class VantageXmlDbParser():
         """Parses a button device that part of a keypad."""
         try:
             vid = int(button_xml.get('VID'))
-            xml_name = button_xml.find('Name')
+            xml_name = button_xml.findtext('Name')
             name = ""
-            if xml_name is not None:
-                name = xml_name.text.strip()
+            if xml_name:
+                name = xml_name.strip()
                 # By default Design Center names each button on a
                 # keypad "Button 1", "Button 2", etc.  This is not
                 # useful.  So if a user has those names, treat it as
@@ -904,21 +931,22 @@ class VantageXmlDbParser():
                 # Design Center, but why would you bother?  If no name
                 # is present, just use the descriptive text which
                 # appears on the actual button:
-                xml_name = button_xml.find("Text1")
-                if xml_name is None:
+                xml_name = button_xml.findtext("Text1")
+                if not xml_name:
                     return None
-                xml_text2 = button_xml.find("Text2")
-                text1 = xml_name.text or ""
-                text2 = xml_text2.text or ""
+                xml_text2 = button_xml.findtext("Text2")
+                text1 = xml_name or ""
+                text2 = xml_text2 or ""
                 name = text1.strip() + ' ' + text2.strip()
             name += ' [B]'
             # no Text1 sub-element on DryContact
             parent = button_xml.find('Parent')
-            parent_vid = int(parent.text)
-            text1 = button_xml.find('Text1').text
-            text2 = button_xml.find('Text2').text
+            parent_vid = int(parent.text) if parent and parent.isnumeric() else -1
+            text1 = button_xml.findtext('Text1')
+            text2 = button_xml.findtext('Text2')
             desc = _desc_from_t1t2(text1, text2)
-            num = int(parent.get('Position'))
+            position = parent.get('Position') 
+            num = int(position) if position else -1
             keypad = self._vantage._ids['KEYPAD'].get(parent_vid)
             if keypad is None:
                 irzone = self.vid_to_area.get(parent_vid)
@@ -1584,8 +1612,28 @@ class Area():
 
     @property
     def vid(self):
-        """The integration id of the area."""
+        """The integration id of the area.""" 
         return self._vid
+
+    @name.setter
+    def name(self, value:str):
+        """Returns the name of this area."""
+        self._name = value
+
+    @parent.setter
+    def parent(self, value: int):
+        """Returns the vid of the parent area."""
+        self._parent = value
+
+    @property
+    def note(self):
+        """Returns the note of this area."""
+        return self._note
+
+    @note.setter
+    def note(self, value:str):
+        """Returns the note of this area."""
+        self._note = value
 
     @property
     def outputs(self):
