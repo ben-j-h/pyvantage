@@ -715,6 +715,10 @@ class VantageXmlDbParser():
 
             output_type = 'LIGHT'
 
+            if (load_type == 'Motor'):
+                output_type = 'FAN'
+
+
             # TODO: find a better heuristic so that on/off lights still show up
             if (load_type == 'High Voltage Relay' or
                 load_type == 'Low Voltage Relay'):
