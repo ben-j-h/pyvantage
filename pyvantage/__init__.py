@@ -911,6 +911,8 @@ class VantageXmlDbParser():
         # one.
         try:
             vid = int(dc_xml.get('VID'))
+            text1 = dc_xml.findtext('Text1')
+            text2 = dc_xml.findtext('Text2')
             if self.vid_to_shade.get(vid):
                 _LOGGER.debug("Skipping vid=%d as drycontact "
                               "because already part of a BLIND3", vid)
@@ -920,13 +922,31 @@ class VantageXmlDbParser():
             parent_vid = int(parent)
             area_xml = dc_xml.findtext('Area')
             area_vid = int(area_xml) if area_xml and area_xml.isnumeric() else -1
-            num = 0
-            keypad = None
             _LOGGER.debug("Found DryContact with vid = %d", vid)
             # Ugh, awful -- three different ways of representing bad-value
-            button = Button(self._vantage, name, area_vid, vid, num,
-                            parent_vid, keypad, False)
-            return button
+            parent = dc_xml.find('Parent')
+            parent_vid = int(parent.text) if parent.text and parent.text.isnumeric() else -1
+            desc = _desc_from_t1t2(text1, text2)
+            position = parent.get('Position') 
+            num = int(position) if position else -1
+            keypad = self._vantage._ids['KEYPAD'].get(parent_vid)
+            if keypad is None:
+                irzone = self.vid_to_area.get(parent_vid)
+                if irzone is None:
+                    _LOGGER.debug("No parent vid = %d for button vid = %d "
+                                  "(leaving button out)",
+                                  parent_vid, vid)
+                    return None
+
+                button = Button(self._vantage, name, irzone.vid, vid, num,
+                                parent_vid, keypad, desc)
+
+            else:
+                area = keypad.area
+                button = Button(self._vantage, name, area, vid, num,
+                                parent_vid, keypad, desc)
+                keypad.add_button(button)
+            return button            
         except Exception as e:
             _LOGGER.warning("Error parsing drycontact vid = %d: %s",
                             vid, e)
