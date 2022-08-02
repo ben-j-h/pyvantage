@@ -350,6 +350,7 @@ class VantageXmlDbParser():
         self.load_groups = []
         self.vid_to_area = {}
         self.vid_to_load = {}
+        self.backbox_to_area = {}
         self.vid_to_keypad = {}
         self.vid_to_button = {}
         self.vid_to_variable = {}
@@ -484,6 +485,7 @@ class VantageXmlDbParser():
                 
             
         load_groups = root.findall(".//Objects//LoadGroup[@VID]")
+        load_groups = load_groups + root.findall(".//Objects//ScenePointRelay[@VID]")
         for lg_xml in load_groups:
             lgroup = self._parse_load_group(lg_xml)
             if lgroup is None:
@@ -501,9 +503,18 @@ class VantageXmlDbParser():
                 self.vid_to_load[lgroup.vid].load_type = lgroup.load_type or self.vid_to_load[lgroup.vid].load_type
                 self.vid_to_load[lgroup.vid].cc_vid = lgroup.cc_vid or self.vid_to_load[lgroup.vid].cc_vid
 
+        backboxes = root.findall(".//Objects//BackBox[@VID]")
+        for bb_xml in backboxes:
+            backbox_vid = int(bb_xml.get('VID'))
+            backbox_area = int(bb_xml.findtext('Area'))
+            if backbox_vid and backbox_area:
+                self.backbox_to_area[backbox_vid] = backbox_area
+        
         keypads = root.findall(".//Objects//Keypad[@VID]")
         keypads = keypads + root.findall(".//Objects//DualRelayStation[@VID]")
         keypads = keypads + root.findall(".//Objects//IRZone[@VID]")
+        keypads = keypads + root.findall(".//Objects//ScenePointRelay[@VID]")
+        keypads = keypads + root.findall(".//Objects//TPT[@VID]")
         for kp_xml in keypads:
             keypad = self._parse_keypad(kp_xml)
             _LOGGER.debug("keypad = %s", keypad)
@@ -874,6 +885,11 @@ class VantageXmlDbParser():
         """Parses a keypad device."""
         area_xml = keypad_xml.find('Area')
         area_vid = int(area_xml.text) if area_xml else -1
+        if area_vid < 1:
+            parent_xml = keypad_xml.find('Parent')
+            parent_vid = int(parent_xml.text) if parent_xml.text and parent_xml.text.isnumeric() else -1        
+            if parent_vid > 0:
+                area_vid = self.backbox_to_area[parent_vid]
         keypad = Keypad(self._vantage,
                         name=keypad_xml.findtext('Name') + ' [K]',
                         area=area_vid,
@@ -921,6 +937,8 @@ class VantageXmlDbParser():
         try:
             vid = int(button_xml.get('VID'))
             xml_name = button_xml.findtext('Name')
+            text1 = button_xml.findtext('Text1')
+            text2 = button_xml.findtext('Text2')
             name = ""
             if xml_name:
                 name = xml_name.strip()
@@ -935,19 +953,17 @@ class VantageXmlDbParser():
                 # Design Center, but why would you bother?  If no name
                 # is present, just use the descriptive text which
                 # appears on the actual button:
-                xml_name = button_xml.findtext("Text1")
+                xml_name = text1
                 if not xml_name:
                     return None
-                xml_text2 = button_xml.findtext("Text2")
+                xml_text2 = text2
                 text1 = xml_name or ""
                 text2 = xml_text2 or ""
                 name = text1.strip() + ' ' + text2.strip()
             name += ' [B]'
             # no Text1 sub-element on DryContact
             parent = button_xml.find('Parent')
-            parent_vid = int(parent.text) if parent and parent.isnumeric() else -1
-            text1 = button_xml.findtext('Text1')
-            text2 = button_xml.findtext('Text2')
+            parent_vid = int(parent.text) if parent.text and parent.text.isnumeric() else -1
             desc = _desc_from_t1t2(text1, text2)
             position = parent.get('Position') 
             num = int(position) if position else -1
@@ -1415,7 +1431,7 @@ class Vantage():
                      len(self._vid_to_load.keys()),
                      len(self._vid_to_variable.keys()),
                      len(self._vid_to_shade.keys()))
-
+                     
         return True
 
 
