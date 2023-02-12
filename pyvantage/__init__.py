@@ -215,8 +215,8 @@ class VantageConnection(threading.Thread):
                 _LOGGER.info("Vantage #%s send_ascii_nl: %s", i, cmd)
         try:
             self._telnet[i].write(cmd.encode('ascii') + b'\r\n')
-        except BrokenPipeError:
-            _LOGGER.warning("Vantage BrokenPipeError - disconnected but retrying")
+        except BrokenPipeError as err:
+            _LOGGER.warning(f'Vantage BrokenPipeError - disconnected but retrying for "{cmd}", connection #{i}', exc_info=err)
             self._connected[i] = False
 
     def send_ascii_nl(self, cmd):
@@ -224,6 +224,9 @@ class VantageConnection(threading.Thread):
 
         Must not hold self._lock"""
         with self._lock:
+            if not self._connected[self._iconn]:
+                _LOGGER.info(f"attempting reconnecting for connection {self._iconn}")
+                self._connected[self._iconn] = self._do_login_locked(self._iconn)
             self._send_ascii_nl_locked(cmd, self._iconn)
             if not cmd.startswith("GET"):
                 self._iconn = (self._iconn + 1) % self._num_connections
