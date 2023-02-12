@@ -215,9 +215,10 @@ class VantageConnection(threading.Thread):
                 _LOGGER.info("Vantage #%s send_ascii_nl: %s", i, cmd)
         try:
             self._telnet[i].write(cmd.encode('ascii') + b'\r\n')
-        except BrokenPipeError as err:
-            _LOGGER.warning(f'Vantage BrokenPipeError - disconnected but retrying for "{cmd}", connection #{i}', exc_info=err)
+        except (BrokenPipeError,ConnectionResetError) as err:
+            _LOGGER.warning(f'Vantage {type(err)} - disconnected but retrying for "{cmd}", connection #{i}', exc_info=err)
             self._connected[i] = False
+            
 
     def send_ascii_nl(self, cmd):
         """Sends the specified command to the vantage controller.
@@ -225,7 +226,7 @@ class VantageConnection(threading.Thread):
         Must not hold self._lock"""
         with self._lock:
             if not self._connected[self._iconn]:
-                _LOGGER.info(f"attempting reconnecting for connection {self._iconn}")
+                _LOGGER.info(f"attempting reconnect for connection {self._iconn}")
                 self._connected[self._iconn] = self._do_login_locked(self._iconn)
             self._send_ascii_nl_locked(cmd, self._iconn)
             if not cmd.startswith("GET"):
@@ -237,29 +238,29 @@ class VantageConnection(threading.Thread):
         while True:
             try:
                 self._telnet[i] = telnetlib.Telnet(self._host, self._cmd_port)
+                if not (self._user is None or self._password is None):
+                    _LOGGER.debug("Connection #%s is made, logging in", i)
+                    self._send_ascii_nl_locked("LOGIN " + self._user +
+                                            " " + self._password, i)
+                    _LOGGER.debug("reading login response for #%s", i)
+                    self._telnet[i].read_until(b'\r\n', 2)
+                if i == 0:
+                    self._send_ascii_nl_locked("STATUS LOAD", i)
+                    self._telnet[i].read_until(b'\r\n', 2)
+                    self._send_ascii_nl_locked("STATUS BLIND", i)
+                    self._telnet[i].read_until(b'\r\n', 2)
+                    self._send_ascii_nl_locked("STATUS BTN", i)
+                    self._telnet[i].read_until(b'\r\n', 2)
+                    self._send_ascii_nl_locked("STATUS VARIABLE", i)
+                    self._telnet[i].read_until(b'\r\n', 2)                
                 break
             except Exception as e:
                 _LOGGER.warning("Could not connect #%s to %s:%d, "
                                 "retrying after 3 sec (%s)", i,
                                 self._host, self._cmd_port,
-                                e)
+                                exc_info=e)
                 time.sleep(3)
                 continue
-        if not (self._user is None or self._password is None):
-            _LOGGER.debug("Connection #%s is made, logging in", i)
-            self._send_ascii_nl_locked("LOGIN " + self._user +
-                                       " " + self._password, i)
-            _LOGGER.debug("reading login response for #%s", i)
-            self._telnet[i].read_until(b'\r\n', 2)
-        if i == 0:
-            self._send_ascii_nl_locked("STATUS LOAD", i)
-            self._telnet[i].read_until(b'\r\n', 2)
-            self._send_ascii_nl_locked("STATUS BLIND", i)
-            self._telnet[i].read_until(b'\r\n', 2)
-            self._send_ascii_nl_locked("STATUS BTN", i)
-            self._telnet[i].read_until(b'\r\n', 2)
-            self._send_ascii_nl_locked("STATUS VARIABLE", i)
-            self._telnet[i].read_until(b'\r\n', 2)
         return True
 
     def _disconnect_locked(self):
@@ -303,8 +304,8 @@ class VantageConnection(threading.Thread):
                 with self._lock:
                     self._disconnect_locked()
                 continue
-            except BrokenPipeError:
-                _LOGGER.warning("run got BrokenPipeError")
+            except (BrokenPipeError,ConnectionResetError) as err:
+                _LOGGER.warning(f"run got {type(err)}",exc_info=err)
                 with self._lock:
                     self._disconnect_locked()
                 continue
