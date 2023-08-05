@@ -359,6 +359,16 @@ class VantageConnection(threading.Thread):
             self._send_ascii_nl_locked("STATUS VARIABLE", i)
             self._read_until(b'\r\n', i)
         return True
+    
+    def _disconnect_locked(self):
+        self._connected = [False] * self._num_connections
+        self._connect_cond.notify_all()
+
+        for i in range(0, self._num_connections):
+            self._sockets[i].close()
+            self._sockets[i] = None
+
+        _LOGGER.warning("Disconnected")
 
     def _maybe_reconnect(self):
         """Reconnects to controller if we have been previously disconnected."""
@@ -402,6 +412,8 @@ class VantageConnection(threading.Thread):
                 with self._lock:
                     self._disconnect_locked()
                 continue
+
+            
 
 def _desc_from_t1t2(title1, title2):
     if not title2:
@@ -718,7 +730,6 @@ class VantageXmlDbParser():
                         parent=int(area_parent) if area_parent and area_parent.isnumeric() else -1,
                         vid=vid,
                         note=area_xml.findtext('Note'))
-                        note=area_xml.findtext('Note'))
             return area
         except Exception as e:
             _LOGGER.warning("Error parsing Area vid = %d: %s", vid, e)
@@ -728,7 +739,6 @@ class VantageXmlDbParser():
         try:
             vid = int(irzone_xml.get('VID'))
             irzone = Area(self._vantage,
-                          name=irzone_xml.findtext('Name'),
                           name=irzone_xml.findtext('Name'),
                           parent=0,
                           vid=vid,
@@ -747,7 +757,6 @@ class VantageXmlDbParser():
                 subtype = subtype_node.text.lower()
             var = Variable(self._vantage,
                            name=var_xml.findtext('Name'),
-                           name=var_xml.findtext('Name'),
                            vid=vid, subtype=subtype)
             return var
         except Exception as e:
@@ -762,9 +771,7 @@ class VantageXmlDbParser():
                 "Current": "current",
                 "Temperature": "sensor"
             }[sensor_xml.findtext('Model')]
-            }[sensor_xml.findtext('Model')]
             sensor = OmniSensor(self._vantage,
-                                name=sensor_xml.findtext('Name'),
                                 name=sensor_xml.findtext('Name'),
                                 kind=kind,
                                 vid=int(sensor_xml.get('VID')))
