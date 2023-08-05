@@ -591,8 +591,7 @@ class VantageXmlDbParser():
                 self.vid_to_load[output.vid].cc_vid = output.cc_vid or self.vid_to_load[output.vid].cc_vid
                 
             
-        load_groups = root.findall(".//Objects//LoadGroup[@VID]")
-        load_groups = load_groups + root.findall(".//Objects//ScenePointRelay[@VID]")
+        load_groups = objects.findall("Object/LoadGroup[@VID]")
         for lg_xml in load_groups:
             lgroup = self._parse_load_group(lg_xml)
             if lgroup is None:
@@ -610,7 +609,7 @@ class VantageXmlDbParser():
                 self.vid_to_load[lgroup.vid].load_type = lgroup.load_type or self.vid_to_load[lgroup.vid].load_type
                 self.vid_to_load[lgroup.vid].cc_vid = lgroup.cc_vid or self.vid_to_load[lgroup.vid].cc_vid
 
-        backboxes = root.findall(".//Objects//BackBox[@VID]")
+        backboxes = objects.findall("Object/BackBox[@VID]")
         for bb_xml in backboxes:
             backbox_vid = int(bb_xml.get('VID'))
             backbox_area = int(bb_xml.findtext('Area'))
