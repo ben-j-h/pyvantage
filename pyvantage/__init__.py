@@ -20,8 +20,8 @@ For development, I do:
 
 $ docker-shell homeassistant
 > cd /usr/local/lib/python3.7/site-packages/pyvantage/
-> cp /config/pyvantage/pyvantage/_init__.py . 
-# or 
+> cp /config/pyvantage/pyvantage/_init__.py .
+# or
 > cp /config/pyvantage/pyvantage/__init__.py /usr/local/lib/python3.7/site-packages/pyvantage
 # where /config in the docker image points to my home assistant config directory
 # which has a pyvantage subdirectory containing a clone of the github repo.
@@ -29,7 +29,7 @@ $ docker-shell homeassistant
 """
 
 __Author__ = "Greg J. Badros"
-__copyright__ = "Copyright 2018, 2019, 2020 Greg J. Badros"
+__copyright__ = "Copyright 2018-2023 Greg J. Badros"
 
 # USAGE:
 #
@@ -67,6 +67,9 @@ __copyright__ = "Copyright 2018, 2019, 2020 Greg J. Badros"
 # Keypad            | Keypad           | vc.keypads
 # DualRelayStation  | Keypad           | vc.keypads
 # IRZone            | Keypad           | vc.keypads
+# Dimmer            | Keypad           | vc.keypads
+# EqCtrl            | Keypad           | vc.keypads
+# EqUx              | Keypad           | vc.keypads
 # Button            | Button           | vc.buttons
 # DryContact        | Button           | vc.buttons
 # GMem              | Variable         | vc.variables
@@ -107,8 +110,8 @@ __copyright__ = "Copyright 2018, 2019, 2020 Greg J. Badros"
 #  light.mh_m_great_room_big_ass_fan (load_type == Motor)
 
 import logging
-import telnetlib
 import socket
+import ssl
 import select
 import threading
 import time
@@ -117,13 +120,13 @@ import re
 import json
 import os
 import traceback
+import math
 
 from collections import deque
 from xml.sax.saxutils import escape
 
-from colormath.color_objects import sRGBColor, HSVColor
-from colormath.color_conversions import convert_color
-
+from colorsys import hsv_to_rgb, rgb_to_hsv
+from xml.etree import ElementTree as ET
 
 def kelvin_to_level(kelvin):
     """Convert kelvin temperature to a USAI level."""
@@ -149,6 +152,65 @@ def level_to_mireds(level):
     mireds = 1000000/kelvin
     return mireds
 
+def kelvin_to_rgb(colour_temperature):
+    """
+    Converts from K to RGB, algorithm courtesy of
+    http://www.tannerhelland.com/4435/convert-temperature-rgb-algorithm-code/
+    """
+    #range check
+    if colour_temperature < 1000:
+        colour_temperature = 1000
+    elif colour_temperature > 40000:
+        colour_temperature = 40000
+
+    tmp_internal = colour_temperature / 100.0
+
+    # red
+    if tmp_internal <= 66:
+        red = 255
+    else:
+        tmp_red = 329.698727446 * math.pow(tmp_internal - 60, -0.1332047592)
+        if tmp_red < 0:
+            red = 0
+        elif tmp_red > 255:
+            red = 255
+        else:
+            red = tmp_red
+
+    # green
+    if tmp_internal <=66:
+        tmp_green = 99.4708025861 * math.log(tmp_internal) - 161.1195681661
+        if tmp_green < 0:
+            green = 0
+        elif tmp_green > 255:
+            green = 255
+        else:
+            green = tmp_green
+    else:
+        tmp_green = 288.1221695283 * math.pow(tmp_internal - 60, -0.0755148492)
+        if tmp_green < 0:
+            green = 0
+        elif tmp_green > 255:
+            green = 255
+        else:
+            green = tmp_green
+
+    # blue
+    if tmp_internal >=66:
+        blue = 255
+    elif tmp_internal <= 19:
+        blue = 0
+    else:
+        tmp_blue = 138.5177312231 * math.log(tmp_internal - 10) - 305.0447927307
+        if tmp_blue < 0:
+            blue = 0
+        elif tmp_blue > 255:
+            blue = 255
+        else:
+            blue = tmp_blue
+
+    return red, green, blue
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -169,7 +231,7 @@ class VantageConnection(threading.Thread):
     """Encapsulates the connection to the Vantage controller."""
 
     def __init__(self, host, user, password, cmd_port, recv_callback,
-                 commdebug=True, num_connections=2):
+                 commdebug=True, num_connections=2, use_ssl=False):
         """Initializes the vantage connection, doesn't actually connect."""
         threading.Thread.__init__(self, name="VantageConnection")
 
@@ -177,15 +239,20 @@ class VantageConnection(threading.Thread):
         self._user = user
         self._password = password
         self._cmd_port = cmd_port
+        self._use_ssl = use_ssl
         self._num_connections = num_connections
-        self._telnet = [None] * num_connections
+        self._sockets = [None] * num_connections
         self._connected = [False] * num_connections
-        self._iconn = 0  # index into the _telnet array
+        self._iconn = 0  # index into the _sockets array
         self._lock = threading.RLock()
         self._connect_cond = threading.Condition(lock=self._lock)
         self._recv_cb = recv_callback
         self._done = False
         self._commdebug = commdebug
+        self._chunk = b''
+
+        if use_ssl:
+            self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
 
         self.setDaemon(True)
 
@@ -214,7 +281,7 @@ class VantageConnection(threading.Thread):
             else:
                 _LOGGER.info("Vantage #%s send_ascii_nl: %s", i, cmd)
         try:
-            self._telnet[i].write(cmd.encode('ascii') + b'\r\n')
+            self._sockets[i].send(cmd.encode('ascii') + b'\r\n')
         except (BrokenPipeError,ConnectionResetError) as err:
             _LOGGER.warning(f'Vantage {type(err)} - disconnected but retrying for "{cmd}", connection #{i}', exc_info=err)
             self._connected[i] = False
@@ -232,41 +299,75 @@ class VantageConnection(threading.Thread):
             if not cmd.startswith("GET"):
                 self._iconn = (self._iconn + 1) % self._num_connections
 
+    def _read_until(self, delimiter, i):
+        """Read data from a socket until a delimiter is found."""
+        try:
+            while True:
+                if delimiter in self._chunk:
+                    break
+                new_chunk = self._sockets[i].recv(1024)
+                if not new_chunk:
+                    break
+                self._chunk += new_chunk
+        except socket.timeout:
+            pass
+        data_and_rest = self._chunk.split(delimiter, 1)
+        if len(data_and_rest) == 1:
+            data = data_and_rest[0]
+            self._chunk = b''
+        else:
+            [data, self._chunk] = data_and_rest
+
+        return data
+
     def _do_login_locked(self, i):
-        """Executes the login procedure (telnet) as well as setting up some
+        """Executes the login procedure as well as setting up some
         connection defaults like turning off the prompt, etc."""
         while True:
             try:
-                self._telnet[i] = telnetlib.Telnet(self._host, self._cmd_port)
-                if not (self._user is None or self._password is None):
-                    _LOGGER.debug("Connection #%s is made, logging in", i)
-                    self._send_ascii_nl_locked("LOGIN " + self._user +
-                                            " " + self._password, i)
-                    _LOGGER.debug("reading login response for #%s", i)
-                    self._telnet[i].read_until(b'\r\n', 2)
-                if i == 0:
-                    self._send_ascii_nl_locked("STATUS LOAD", i)
-                    self._telnet[i].read_until(b'\r\n', 2)
-                    self._send_ascii_nl_locked("STATUS BLIND", i)
-                    self._telnet[i].read_until(b'\r\n', 2)
-                    self._send_ascii_nl_locked("STATUS BTN", i)
-                    self._telnet[i].read_until(b'\r\n', 2)
-                    self._send_ascii_nl_locked("STATUS VARIABLE", i)
-                    self._telnet[i].read_until(b'\r\n', 2)                
+                self._sockets[i] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._sockets[i].connect((self._host, self._cmd_port))
+
+                if self._use_ssl:
+                    self._sockets[i] = self._ssl_context.wrap_socket(self._sockets[i])
+
+                self._sockets[i].settimeout(2)
                 break
             except Exception as e:
                 _LOGGER.warning("Could not connect #%s to %s:%d, "
                                 "retrying after 3 sec (%s)", i,
                                 self._host, self._cmd_port,
-                                exc_info=e)
+                                e)
                 time.sleep(3)
                 continue
-        return True
+        if not (self._user is None or self._password is None):
+            _LOGGER.debug("Connection #%s is made, logging in", i)
+            self._send_ascii_nl_locked("LOGIN " + self._user +
+                                       " " + self._password, i)
+            _LOGGER.debug("reading login response for #%s", i)
+            self._read_until(b'\r\n', i)
+        if i == 0:
+            self._send_ascii_nl_locked("STATUS LOAD", i)
+            self._read_until(b'\r\n', i)
 
+            self._send_ascii_nl_locked("STATUS BLIND", i)
+            self._read_until(b'\r\n', i)
+
+            self._send_ascii_nl_locked("STATUS BTN", i)
+            self._read_until(b'\r\n', i)
+
+            self._send_ascii_nl_locked("STATUS VARIABLE", i)
+            self._read_until(b'\r\n', i)
+        return True
+    
     def _disconnect_locked(self):
         self._connected = [False] * self._num_connections
         self._connect_cond.notify_all()
-        self._telnet = [None] * self._num_connections
+
+        for i in range(0, self._num_connections):
+            self._sockets[i].close()
+            self._sockets[i] = None
+
         _LOGGER.warning("Disconnected")
 
     def _maybe_reconnect(self):
@@ -290,15 +391,17 @@ class VantageConnection(threading.Thread):
         while True:
             self._maybe_reconnect()
             try:
-                sockets = [t.get_socket() for t in self._telnet]
-                readable, _, exceptional = select.select(sockets, [], [])
-                for i, t in enumerate(self._telnet):
-                    if t.get_socket() in exceptional:
+                readable, _, exceptional = select.select(self._sockets, [], [])
+                for i, sock in enumerate(self._sockets):
+                    if sock in exceptional:
                         _LOGGER.error("Exceptional socket #%s: %s", i, t)
                         raise EOFError()
-                    if t.get_socket() in readable:
-                        line = self._telnet[i].read_until(b"\n", 2)
-                        self._recv_cb(line.decode('ascii').rstrip(), i)
+                    if sock in readable:
+                        line = self._read_until(b'\r\n', i)
+                        try:
+                            self._recv_cb(line.decode('ascii').rstrip(), i)
+                        except Exception as e:
+                            _LOGGER.error("Exception in recv_cb on line %s: %s", line, e)
             except EOFError:
                 _LOGGER.warning("run got EOFError")
                 with self._lock:
@@ -310,6 +413,7 @@ class VantageConnection(threading.Thread):
                     self._disconnect_locked()
                 continue
 
+            
 
 def _desc_from_t1t2(title1, title2):
     if not title2:
@@ -352,7 +456,8 @@ class VantageXmlDbParser():
         self.keypads = []
         self.sensors = []
         self.load_groups = []
-        self.vid_to_area = {}
+        self.last_area_vid = -1
+        self.vid_to_area = vantage._vid_to_area = {}
         self.vid_to_load = {}
         self.backbox_to_area = {}
         self.vid_to_keypad = {}
@@ -373,8 +478,6 @@ class VantageXmlDbParser():
         stuffs them into the appropriate hierarchy.
         """
 
-        import xml.etree.ElementTree as ET
-
         root = ET.fromstring(self._xml_db_str)
         # The structure of a Lutron config is something like this:
         # <Areas>
@@ -394,7 +497,8 @@ class VantageXmlDbParser():
         # Timer (with @VID and <Name> )
         # Keypad (with @VID and <Name> )
 
-        areas = root.findall(".//Objects//Area[@VID]")
+        objects = root.find("Objects")
+        areas = objects.findall("Object/Area[@VID]")
         for area_xml in areas:
             if self.project_name is None:
                 self.project_name = area_xml.findtext('Name')
@@ -408,7 +512,7 @@ class VantageXmlDbParser():
                 self.vid_to_area[area.vid].parent = area.parent if area.parent and area.parent > self.vid_to_area[area.vid].parent else self.vid_to_area[area.vid].parent
                 self.vid_to_area[area.vid].note = area.note or self.vid_to_area[area.vid].note
 
-        irzones = root.findall(".//Objects//IRZone[@VID]")
+        irzones = objects.findall("Object/IRZone[@VID]")
         for irzone_xml in irzones:
             area = self._parse_irzone(irzone_xml)
             _LOGGER.debug("IRZone = %s", area)
@@ -419,8 +523,8 @@ class VantageXmlDbParser():
                 self.vid_to_area[area.vid].parent = area.parent if area.parent and area.parent > self.vid_to_area[area.vid].parent else self.vid_to_area[area.vid].parent
                 self.vid_to_area[area.vid].note = area.note or self.vid_to_area[area.vid].note
 
-        loads = root.findall(".//Objects//Load[@VID]")
-        loads = loads + root.findall(".//Objects//Vantage.DDGColorLoad[@VID]")
+        # note the extra '/' after 'Object/ -- the Vantage.DDGColorLoad elements aren't always direct descendents of Object
+        loads = objects.findall("Object/Load[@VID]") + objects.findall("Object/Vantage.DDGColorLoad[@VID]")
         other_loads = []
         color_loads = []
         open_loads = []
@@ -444,18 +548,18 @@ class VantageXmlDbParser():
                 _LOGGER.debug("Looking for close_name = %s", close_name)
                 _LOGGER.debug("Looking for stop_name = %s", stop_name)
                 _LOGGER.debug("Looking for isopen_name = %s", isopen_name)
-                close_load_xml = root.findall(
-                    ".//Objects//Load[Name='" + close_name + "']")
+                close_load_xml = objects.findall(
+                    "Object/Load[Name='" + close_name + "']")
                 if len(close_load_xml) == 1:
                     close_load_xml = close_load_xml[0]
-                    isopen_contact_xml = root.findall(
-                        ".//Objects//DryContact[Name='" + isopen_name + "']")
+                    isopen_contact_xml = objects.findall(
+                        "Object/DryContact[Name='" + isopen_name + "']")
                     if len(isopen_contact_xml) == 1:
                         isopen_contact_xml = isopen_contact_xml[0]
                     else:
                         isopen_contact_xml = None
-                    stop_load_xml = root.findall(
-                        ".//Objects//Load[Name='" + stop_name + "']")
+                    stop_load_xml = objects.findall(
+                        "Object/Load[Name='" + stop_name + "']")
                     if len(stop_load_xml) == 1:
                         stop_load_xml = stop_load_xml[0]
                     else:
@@ -464,8 +568,7 @@ class VantageXmlDbParser():
                                                 load_xml,
                                                 close_load_xml,
                                                 stop_load_xml)
-                    for v in shade.vids:
-                        skip_load_vids.add(v)
+                    skip_load_vids = { k for k in shade.vids if k is not None }
                     self.vid_to_shade[shade.vid] = shade
                     self.outputs.append(shade)
                     _LOGGER.debug("shade3 = %s", shade)
@@ -514,11 +617,8 @@ class VantageXmlDbParser():
             if backbox_vid and backbox_area:
                 self.backbox_to_area[backbox_vid] = backbox_area
         
-        keypads = root.findall(".//Objects//Keypad[@VID]")
-        keypads = keypads + root.findall(".//Objects//DualRelayStation[@VID]")
-        keypads = keypads + root.findall(".//Objects//IRZone[@VID]")
-        keypads = keypads + root.findall(".//Objects//ScenePointRelay[@VID]")
-        keypads = keypads + root.findall(".//Objects//TPT[@VID]")
+        keypads = [obj for t in ["Keypad", "DualRelayStation", "IRZone", "Dimmer", "EqCtrl", "EqUX","ScenePointRelay","TPT"]
+                       for obj in objects.findall(f"Object/{t}[@VID]")]
         for kp_xml in keypads:
             keypad = self._parse_keypad(kp_xml)
             _LOGGER.debug("keypad = %s", keypad)
@@ -527,7 +627,7 @@ class VantageXmlDbParser():
                 self.vid_to_area[keypad.area].add_keypad(keypad)
             self.keypads.append(keypad)
 
-        buttons = root.findall(".//Objects//Button[@VID]")
+        buttons = objects.findall("Object/Button[@VID]")
         for button_xml in buttons:
             b = self._parse_button(button_xml)
             if not b:
@@ -538,7 +638,7 @@ class VantageXmlDbParser():
                 self.vid_to_area[b.area].add_button(b)
                 self.buttons.append(b)
 
-        drycontacts = root.findall(".//Objects//DryContact[@VID]")
+        drycontacts = objects.findall("Object/DryContact[@VID]")
         for dc_xml in drycontacts:
             dc = self._parse_drycontact(dc_xml)
             if not dc:
@@ -547,7 +647,7 @@ class VantageXmlDbParser():
             self.vid_to_button[dc.vid] = dc
             self.buttons.append(dc)
 
-        variables = root.findall(".//Objects//GMem[@VID]")
+        variables = objects.findall("Object/GMem[@VID]")
         for v in variables:
             var = self._parse_variable(v)
             _LOGGER.debug("var = %s", var)
@@ -555,7 +655,7 @@ class VantageXmlDbParser():
             # N.B. variables have categories, not areas, so no add to area
             self.variables.append(var)
 
-        omnisensors = root.findall(".//Objects//OmniSensor[@VID]")
+        omnisensors = objects.findall("Object/OmniSensor[@VID]")
         for s in omnisensors:
             sensor = self._parse_omnisensor(s)
             _LOGGER.debug("sensor = %s", sensor)
@@ -563,7 +663,7 @@ class VantageXmlDbParser():
             # N.B. variables have categories, not areas, so no add to area
             self.sensors.append(sensor)
 
-        lightsensors = root.findall(".//Objects//LightSensor[@VID]")
+        lightsensors = objects.findall("Object/LightSensor[@VID]")
         for s in lightsensors:
             sensor = self._parse_lightsensor(s)
             _LOGGER.debug("sensor = %s", sensor)
@@ -571,7 +671,7 @@ class VantageXmlDbParser():
             # N.B. variables have categories, not areas, so no add to area
             self.sensors.append(sensor)
 
-        tasks = root.findall(".//Objects//Task[@VID]")
+        tasks = objects.findall("Object/Task[@VID]")
         for t in tasks:
             task = self._parse_task(t)
             _LOGGER.debug("task = %s", task)
@@ -583,21 +683,21 @@ class VantageXmlDbParser():
         # Lots of different shade types, one xpath for each kind of shade
         # MechoShade driver shades
         shades = \
-            root.findall(".//Objects//MechoShade.IQ2_Shade_Node_CHILD[@VID]")
+            objects.findall("Object/MechoShade.IQ2_Shade_Node_CHILD[@VID]")
         shades = (shades +
-                  root.findall(".//Objects//MechoShade.IQ2_Group_CHILD[@VID]"))
+                  objects.findall("Object/MechoShade.IQ2_Group_CHILD[@VID]"))
         # Native QIS QMotion shades
-        shades = shades + root.findall(".//Objects//QISBlind[@VID]")
-        shades = shades + root.findall(".//Objects//BlindGroup[@VID]")
+        shades = shades + objects.findall("Object/QISBlind[@VID]")
+        shades = shades + objects.findall("Object/BlindGroup[@VID]")
         # Non-native QIS Driver QMotion shades (the old way)
         shades = (shades +
-                  root.findall(".//Objects//QMotion.QIS_Channel_CHILD[@VID]"))
+                  objects.findall("Object/QMotion.QIS_Channel_CHILD[@VID]"))
         # Somfy radio-controlled
         shades = (shades +
-                  root.findall(".//Objects//Somfy.URTSI_2_Shade_CHILD[@VID]"))
+                  objects.findall("Object/Somfy.URTSI_2_Shade_CHILD[@VID]"))
         # Somfy RS-485 SDN wired shades
         shades = (shades +
-                  root.findall(".//Objects//Somfy.RS-485_Shade_CHILD[@VID]"))
+                  objects.findall("Object/Somfy.RS-485_Shade_CHILD[@VID]"))
 
         for shade_xml in shades:
             shade = self._parse_shade(shade_xml)
@@ -610,6 +710,14 @@ class VantageXmlDbParser():
         _LOGGER.debug("self._name_area_to_vid = %s", self._name_area_to_vid)
 
         return True
+
+    def _object_area_vid(self, obj):
+        """Parses an Area element which designates the VID of the Area that the
+        object is located in."""
+        if obj is None: return self.last_area_vid
+        area = obj.find('Area')
+        if area is None: return self.last_area_vid
+        return int(area.text)
 
     def _parse_area(self, area_xml):
         """Parses an Area tag, which is effectively a room, depending on how the
@@ -851,10 +959,8 @@ class VantageXmlDbParser():
         area_previd = output_xml.findtext('Area')            
         area_vid = int(area_previd) if area_previd and area_previd.isnumeric() else -1
 
-#        area_name = self.vid_to_area[area_vid].name
         loads = output_xml.findall('./LoadTable/Load')
-        vid = output_xml.get('VID')
-        vid = int(vid)
+        vid = int(output_xml.get('VID'))
 
         load_vids = []
         color_vids = []
@@ -903,6 +1009,7 @@ class VantageXmlDbParser():
     def _parse_task(self, task_xml):
         """Parses a task object."""
         task = Task(self._vantage,
+                    name=task_xml.findtext('Name'),
                     name=task_xml.findtext('Name'),
                     vid=int(task_xml.get('VID')))
         return task
@@ -1012,6 +1119,8 @@ class VantageXmlDbParser():
         except Exception as e:
             _LOGGER.warning("Error parsing button vid = %d: %s",
                             vid, e)
+            traceback.print_exc()
+
 
 
 # Connect to port 2001 and write
@@ -1043,7 +1152,9 @@ class Vantage():
                  only_areas=None, exclude_areas=None,
                  cmd_port=3001, file_port=2001,
                  name_mappings=None, filename=None,
-                 commdebug=True, num_connections=1):
+                 commdebug=True, num_connections=1,
+                 hierarchical_names=True,
+                 use_ssl=False):
         """Initializes the Vantage object. No connection is made to the remote
         device."""
         self._host = host
@@ -1053,7 +1164,7 @@ class Vantage():
         if self._host is not None:
             self._conn = VantageConnection(host, user, password, cmd_port,
                                            self._recv, commdebug,
-                                           num_connections)
+                                           num_connections, use_ssl)
         else:
             self._conn = None
             if filename is None:
@@ -1061,10 +1172,12 @@ class Vantage():
         self._cmds = deque([])
         self._name_mappings = name_mappings
         self._file_port = file_port
+        self._use_ssl = use_ssl
         self._only_areas = only_areas
         self._exclude_areas = exclude_areas
-        self._ids = {}
+        self._hierarchical_names = hierarchical_names
         self._names = {}   # maps from unique name to id
+        self._ids = {}
         self._subscribers = {}
         self._vid_to_area = {}  # copied out from the parser
         self._vid_to_load = {}  # copied out from the parser
@@ -1088,6 +1201,9 @@ class Vantage():
         self.buttons = None
         self.keypads = None
         self.sensors = None
+
+        if use_ssl:
+            self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS)
 
     def subscribe(self, obj, handler):
         """Subscribes to status updates of the requested object.
@@ -1140,54 +1256,53 @@ class Vantage():
         if cmd_type2:
             self._ids[cmd_type2][vid] = obj
 
-        # Now give the object a unique name.  We prefix in reverse order the
-        # areas the object is contained in.  So an object may be called "Main
-        # Floor-Kitchen-Ceiling Can Lights".  Every object must have a unique
-        # name, if there is a duplicate then (VID) is attached to the end.
+        # If configured, generate hierarchical object names.
+        # We prefix in reverse order the areas the object is contained in, eg:
+        # "Main Floor-Kitchen-Ceiling Can Lights"
+        if self._hierarchical_names:
+            lineage = self.get_lineage_from_obj(obj)
+            name = ""
+            # reverse all but the last element in list
+            for n in reversed(lineage[:-1]):
+                ns = n.strip()
+                if ns.startswith('Station Load '):
+                    continue
+                if ns.startswith('Color Load '):
+                    continue
+                if self._name_mappings:
+                    mapped_name = self._name_mappings.get(ns.lower())
+                    if mapped_name is not None:
+                        if mapped_name is True:
+                            continue
+                        ns = mapped_name
+                name += ns + "-"
 
-        lineage = self.get_lineage_from_obj(obj)
-        name = ""
-        # reverse all but the last element in list
-        for n in reversed(lineage[:-1]):
-            ns = n.strip()
-            if ns.startswith('Station Load '):
-                continue
-            if ns.startswith('Color Load '):
-                continue
-            if self._name_mappings:
-                mapped_name = self._name_mappings.get(ns.lower())
-                if mapped_name is not None:
-                    if mapped_name is True:
-                        continue
-                    ns = mapped_name
-            name += ns + "-"
-
-        # TODO: this may be a little too hacky
-        # Greg Badros has a convention of naming areas using 2-letter codes.
-        # This makes sure that we use "GH-Bedroom High East"
-        # instead of "GH-GH Bedroom High East"
-        # since it's sometimes convenient to have the short area
-        # at the start of the device name in vantage
-        if obj.name.startswith(name[0:-1]):
-            obj.name = name + obj.name[len(name):]
-        else:
-            obj.name = name + obj.name
+            # TODO: this may be a little too hacky
+            # Greg Badros has a convention of naming areas using 2-letter codes.
+            # This makes sure that we use "GH-Bedroom High East"
+            # instead of "GH-GH Bedroom High East"
+            # since it's sometimes convenient to have the short area
+            # at the start of the device name in vantage
+            if obj.name.startswith(name[0:-1]):
+                obj.name = name + obj.name[len(name):]
+            else:
+                obj.name = name + obj.name
 
         if obj.name in self._names:
             oldname = obj.name
-            obj.name += " (%s)" % (str(obj.vid))
+            obj.name += f" ({obj.vid})"
             if ('0-10V RELAYS' in oldname or
                 'NOT USED' in oldname or cmd_type == 'BTN'):
                 pass
             else:
-                _LOGGER.debug("Repeated name `%s' - adding vid to get %s",
-                              oldname, obj.name)
+                _LOGGER.debug(f"Repeated name `{oldname}' - adding vid to get {obj.name}")
         self._names[obj.name] = obj.vid
+
 
     # Note: invoked on VantageConnection thread.
     def _recv(self, line, i=0):
         """Invoked by the connection manager to process incoming data."""
-        _LOGGER.debug("#%s _recv got line: %s", i, line)
+        _LOGGER.debug(f"#{i} _recv got line: {line}")
         if line == '':
             return
         typ = None
@@ -1204,9 +1319,12 @@ class Vantage():
             cmds = self._s_cmds
             typ = 'S'
         else:
-            _LOGGER.error("#%s _recv got unknown line start character", i)
+            _LOGGER.error("#%s _recv got unknown line start character: %s", i, line)
             return
         parts = re.split(r'[ :]', line[2:])
+        if len(parts) < 2:
+            _LOGGER.error("#%s Got partial line: %s", i, line)
+            return
         cmd_type = parts[0]
         vid = parts[1]
         args = parts[2:]
@@ -1219,9 +1337,9 @@ class Vantage():
         # TODO: is it okay to ignore R:RAMPLOAD responses?
         # or do we need to handle_update_and_notify like with "LOAD",
         # below
-        if line[0] == 'R' and cmd_type in ('STATUS', 'ADDSTATUS',
+        if line[0] == 'R' and cmd_type in {'STATUS', 'ADDSTATUS',
                                            'DELSTATUS', 'INVOKE',
-                                           'GETCUSTOM', 'RAMPLOAD'):
+                                           'GETCUSTOM', 'RAMPLOAD'}:
             return
         if line[0] == 'R' and cmd_type == "ERROR":
             _LOGGER.warning("#%s Got %s on command: %s", i, line,
@@ -1231,11 +1349,9 @@ class Vantage():
         if cmd_type == 'ERROR':
             _LOGGER.error(" #%s _recv got ERROR line: %s", i, line)
             return
-        if cmd_type in ('GETLOAD', 'GETPOWER', 'GETCURRENT',
-                        'GETVARIABLE', 'GETSENSOR', 'GETLIGHT'):
+        if cmd_type in {'GETLOAD', 'GETPOWER', 'GETCURRENT',
+                        'GETVARIABLE', 'GETSENSOR', 'GETLIGHT', 'GETBLIND'}:
             cmd_type = cmd_type[3:]  # strip "GET" from front
-        elif cmd_type == 'GETBLIND':
-            return
         elif cmd_type == 'TASK':
             return
         elif cmd_type == 'VARIABLE':
@@ -1258,7 +1374,7 @@ class Vantage():
             if (typ == 'S' or
                     (typ == 'R' and
                      cmd_type in ('LOAD', 'POWER', 'CURRENT',
-                                  'VARIABLE', 'SENSOR', 'LIGHT'))):
+                                  'VARIABLE', 'SENSOR', 'LIGHT', 'BLIND'))):
                 self.handle_update_and_notify(obj, args, vid)
 
     # Note: invoked on VantageConnection thread.
@@ -1359,7 +1475,19 @@ class Vantage():
                 _LOGGER.info("Vantage config cache is disabled.")
             ts = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             ts.connect((self._host, self._file_port))
+
+            if self._use_ssl:
+                ts = self._ssl_context.wrap_socket(ts)
+
             if self._user:
+                # _LOGGER.info("trying introspection")
+                # ts.send(("<IIntrospection><GetSysInfo><call></call></GetSysInfo></IIntrospection>\n").encode("ascii"))
+                # response = ""
+                # while not response.endswith("</IIntrospection>\n"):
+                #     response += ts.recv(4096).decode('ascii')
+                # _LOGGER.debug("introspection response = " + response)
+
+                _LOGGER.debug("trying to login")
                 ts.send(("<ILogin><Login><call><User>%s</User>"
                          "<Password>%s</Password>"
                          "</call></Login></ILogin>\n"
@@ -1401,12 +1529,18 @@ class Vantage():
             _LOGGER.debug("done reading, size = %s", len(response))
 
             response = response.decode('ascii')
-            response = response[response.find("</Result>\n")+10:]
-            response = response.replace('<?File Encode="Base64" /', '')
-            response = response.replace('?>', '')
-            response = response[:response.find('</return>')]
-            dbytes = base64.b64decode(response)
-            xml_db = dbytes.decode('utf-8')
+            orig_response = response
+
+            try:
+                # read XML preserving processing instructions
+                response = ET.fromstring(response, parser=ET.XMLParser(target=ET.TreeBuilder(insert_pis=True)))
+                response = response.find("GetFile/return")
+                response = next(response.iter(tag=ET.ProcessingInstruction))
+                response = response.text.split()[2][1:]
+                xml_db = base64.b64decode(response).decode('utf-8')
+            except Exception as e:
+                _LOGGER.warning("Could not parse XML response:\n\"\"\"\n%s\n\"\"\"", orig_response)
+                raise e
             if len(xml_db) < 1000:
                 _LOGGER.warning("Downloaded short .dc file; "
                                 " check saved cache file on disk")
@@ -1428,10 +1562,11 @@ class Vantage():
         parser = VantageXmlDbParser(vantage=self, xml_db_str=xml_db)
         self._vid_to_load = parser.vid_to_load
         self._vid_to_variable = parser.vid_to_variable
-        self._vid_to_area = parser.vid_to_area
         self._vid_to_shade = parser.vid_to_shade
+        self._vid_to_task = parser.vid_to_task
+        self._vid_to_sensor = parser.vid_to_sensor
+        self._name_to_task = parser.name_to_task
         self._name = parser.project_name
-
         parser.parse()
         self.outputs = parser.outputs
         self.variables = parser.variables
@@ -1439,14 +1574,6 @@ class Vantage():
         self.buttons = parser.buttons
         self.keypads = parser.keypads
         self.sensors = parser.sensors
-        self._vid_to_load = parser.vid_to_load
-        self._vid_to_variable = parser.vid_to_variable
-        self._vid_to_area = parser.vid_to_area
-        self._vid_to_shade = parser.vid_to_shade
-        self._vid_to_task = parser.vid_to_task
-        self._vid_to_sensor = parser.vid_to_sensor
-        self._name_to_task = parser.name_to_task
-        self._name = parser.project_name
 
         _LOGGER.info("Found Vantage project: %s, %d areas, %d loads, "
                      "%d variables, and %d shades",
@@ -1880,9 +2007,9 @@ class Output(VantageEntity):
                 ramp_sec = self._ramp_sec[1]
             else:
                 ramp_sec = self._ramp_sec[0]
-            self._vantage.send("RAMPLOAD", self._vid, new_level, ramp_sec)
+            self._vantage.send("RAMPLOAD", self._vid, round(new_level), ramp_sec)
         else:
-            self._vantage.send("LOAD", self._vid, new_level)
+            self._vantage.send("LOAD", self._vid, round(new_level))
 
     level = property(_get_level, _set_level)
 
@@ -1902,9 +2029,8 @@ class Output(VantageEntity):
         _LOGGER.debug("%s: rgb = %s", self,
                       json.dumps(new_rgb))
         # INVOKE [vid] RGBLoad.SetRGBW [val0], [val1], [val2], [val3]
-        srgb = sRGBColor(*new_rgb)
-        hs_color = convert_color(srgb, HSVColor)
-        self._hs = [hs_color.hsv_h, hs_color.hsv_s * 100.0]
+        hs_color = rgb_to_hsv(*new_rgb)
+        self._hs = [hs_color[0] * 360.0, hs_color[1] * 100.0]
         self._rgb = new_rgb
         self._rgb_is_dirty = True
         if self._level > 0:
@@ -1918,7 +2044,11 @@ class Output(VantageEntity):
         ratio = self._level/100
         self._vantage.send("INVOKE", self._vid,
                            ("RGBLoad.SetRGBW %d %d %d %d" %
-                            (r*ratio, g*ratio, b*ratio, 0)))
+                            (round(r*ratio), round(g*ratio), round(b*ratio), 0)))
+        if self._dmx_color and self._level > 0:
+            _LOGGER.debug('_invoke_rgb calling rampload to ensure dmx change is triggered')
+            self._vantage.send("RAMPLOAD", self._vid, round(self._level), 0.1)
+
         if self._level > 0:
             self._rgb_is_dirty = False
 
@@ -1936,9 +2066,7 @@ class Output(VantageEntity):
         _LOGGER.debug("%s: hs = %s", self,
                       json.dumps(new_hs))
         self._hs = new_hs
-        hs_color = HSVColor(new_hs[0], new_hs[1]/100.0, 1.0)
-        rgb = convert_color(hs_color, sRGBColor)
-        self._rgb = [rgb.rgb_r, rgb.rgb_g, rgb.rgb_b]
+        self._rgb = list(hsv_to_rgb(new_hs[0]/360.0, new_hs[1]/100.0, 1.0))
         self._invoke_hs()
 
     def _invoke_hs(self):
@@ -1948,6 +2076,12 @@ class Output(VantageEntity):
         self._vantage.send("INVOKE", self._vid,
                            ("RGBLoad.SetHSL %d %d %d" %
                             (h, s, self._level)))
+        if self._dmx_color and self._level > 0:
+            _LOGGER.debug('_invoke_hs calling rampload to ensure dmx change is triggered')
+            self._vantage.send("RAMPLOAD", self._vid, round(self._level), 0.1)
+
+        if self._level > 0:
+            self._rgb_is_dirty = False
 
     @property
     def color_temp(self):
@@ -1963,12 +2097,13 @@ class Output(VantageEntity):
         if self._color_temp == new_color_temp:
             return
         if self._dmx_color or self._load_type == "DW":
-            _LOGGER.debug("%s: Ignoring call to setter for color_temp "
-                          "of dmx_color light", self)
-        else:
-            self._vantage.send("RAMPLOAD", self._color_control_vid,
-                               kelvin_to_level(new_color_temp),
-                               self._ramp_sec[2])
+            rgb = kelvin_to_rgb(new_color_temp)
+            _LOGGER.debug("%s: Using rgb of %s for call to setter for color_temp "
+                          "%s of dmx_color light", self, rgb, new_color_temp)
+            self.rgb = rgb
+        self._vantage.send("RAMPLOAD", self._color_control_vid,
+                            round(kelvin_to_level(new_color_temp)),
+                            self._ramp_sec[2])
         self._color_temp = new_color_temp
 
 # At some later date, we may want to also specify fade and delay times
@@ -2093,7 +2228,7 @@ class Shade3(VantageEntity):
         elif new_level == 100:
             self.open()
             self._level = 100
-        
+
     def __do_query_level(self):
         pass
 
@@ -2273,7 +2408,10 @@ class LoadGroup(Output):
                 self._brightness_vid] = self._vid
 
         for v in load_vids:
-            if self._vantage._vid_to_load[v]._is_dimmable:
+            load = self._vantage._vid_to_load.get(v)
+            if not load:
+                _LOGGER.warning("LoadGroup %s has unknown load vid %d", self, v)
+            if load and load._is_dimmable:
                 self._is_dimmable = True
                 break
 
@@ -2301,7 +2439,7 @@ class LoadGroup(Output):
             return self._vantage._vid_to_load.get(self._brightness_vid)._level
         else:
             return self._level
-    
+
     def _get_level(self):
         """Returns the output level of the group.
         Iff there is one non-color and one color load, then delegate to the non-color load."""
@@ -2329,6 +2467,7 @@ class LoadGroup(Output):
                 self._vantage.send("INVOKE", vid,
                                    ("RGBLoad.SetRGBW %d %d %d %d" %
                                     (r*ratio, g*ratio, b*ratio, 0)))
+                self._vantage.send("RAMPLOAD", vid, round(self._level), 0.1)
         if self._level > 0:
             self._rgb_is_dirty = False
 
@@ -2340,7 +2479,8 @@ class LoadGroup(Output):
             if load and (load._dmx_color or load._load_type == "DW"):
                 self._vantage.send("INVOKE", vid,
                                    ("RGBLoad.SetHSL %d %d %d" %
-                                    (h, s, self._level)))
+                                    (h, s, self._level-1)))
+                self._vantage.send("RAMPLOAD", vid, round(self._level), 0.1)
 
     def __do_query_level(self):
         """Helper to perform the actual query the current dimmer level of the
@@ -2485,7 +2625,11 @@ class PollingSensor(VantageSensor):
             else:
                 value = float(args[0])
         except Exception:
-            value = args[0]
+            if len(args) >= 1:
+                value = args[0]
+            else:
+                _LOGGER.error("No args for sensor value (%s) %s (%d)", self._name, self._kind, self._vid)
+                return self
         _LOGGER.debug("Setting sensor (%s) %s (%d) to %s",
                       self._name, self._kind, self._vid, value)
         self._value = value
