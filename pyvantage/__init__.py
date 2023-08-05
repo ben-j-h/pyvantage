@@ -512,7 +512,7 @@ class VantageXmlDbParser():
                 self.vid_to_area[area.vid].parent = area.parent if area.parent and area.parent > self.vid_to_area[area.vid].parent else self.vid_to_area[area.vid].parent
                 self.vid_to_area[area.vid].note = area.note or self.vid_to_area[area.vid].note
 
-        irzones = objects.findall("Object/IRZone[@VID]")
+        irzones = objects.findall("Object/IRZone[@VID]") + objects.findall("Object/IRX2[@VID]")
         for irzone_xml in irzones:
             area = self._parse_irzone(irzone_xml)
             _LOGGER.debug("IRZone = %s", area)
@@ -993,11 +993,11 @@ class VantageXmlDbParser():
 
     def _parse_keypad(self, keypad_xml):
         """Parses a keypad device."""
-        area_xml = keypad_xml.find('Area')
-        area_vid = int(area_xml.text) if area_xml else -1
+        area_xml = keypad_xml.findtext('Area')
+        area_vid = int(area_xml) if area_xml else -1
         if area_vid < 1:
-            parent_xml = keypad_xml.find('Parent')
-            parent_vid = int(parent_xml.text) if parent_xml.text and parent_xml.text.isnumeric() else -1        
+            parent_xml = keypad_xml.findtext('Parent')
+            parent_vid = int(parent_xml) if parent_xml and parent_xml.isnumeric() else -1        
             if parent_vid > 0:
                 area_vid = self.backbox_to_area[parent_vid]
         keypad = Keypad(self._vantage,
@@ -1009,7 +1009,6 @@ class VantageXmlDbParser():
     def _parse_task(self, task_xml):
         """Parses a task object."""
         task = Task(self._vantage,
-                    name=task_xml.findtext('Name'),
                     name=task_xml.findtext('Name'),
                     vid=int(task_xml.get('VID')))
         return task
